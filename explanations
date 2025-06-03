@@ -1,0 +1,184 @@
+Аналіз та оптимізація SQL-запитів для salesHistoricalCar
+Оригінальний запит
+Код
+USE salesHistoricalCar;
+EXPLAIN ANALYZE
+SELECT s2023.region,
+       s2022.total_sales_2022,
+       s2023.total_sales_2023,
+       ss2023.stock_share_2023
+FROM (
+    SELECT region, SUM(value) as total_sales_2023
+    FROM iea_ev_dataev_saleshistoricalcars
+    WHERE year = 2023
+      AND parameter = 'EV sales'
+      AND mode = 'Cars'
+      AND unit = 'Vehicles'
+    GROUP BY region
+) s2023
+JOIN (
+    SELECT region, SUM(value) as total_sales_2022
+    FROM iea_ev_dataev_saleshistoricalcars
+    WHERE year = 2022
+      AND parameter = 'EV sales'
+      AND mode = 'Cars'
+      AND unit = 'Vehicles'
+    GROUP BY region
+) s2022 ON s2023.region = s2022.region
+JOIN (
+    SELECT region, SUM(value) as stock_share_2023
+    FROM iea_ev_dataev_saleshistoricalcars
+    WHERE year = 2023
+      AND parameter = 'EV stock share'
+      AND mode = 'Cars'
+      AND unit = 'percent'
+    GROUP BY region
+) ss2023 ON s2023.region = ss2023.region
+WHERE s2023.total_sales_2023 > s2022.total_sales_2022 
+  AND ss2023.stock_share_2023 > 5 
+ORDER BY s2023.total_sales_2023 DESC;
+
+Аналіз продуктивності
+
+План виконання: Повне сканування таблиці (Table scan) для кожного підзапиту, що призводить до обробки всіх рядків для year = 2023 та year = 2022.
+Ключові операції: 
+Nested Loop Inner Join з витратами ~70.9-71.5 мс (час).
+Sort для ORDER BY додає 22.3..22.4 мс
+Table scan на таблиці з ~382 рядків (вартість ~382).
+
+
+Проблеми: Відсутність індексів змушує СУБД сканувати всю таблицю для кожного підзапиту, що є неефективним для великих даних.hм
+
+Оптимізація з CTE
+Код
+USE salesHistoricalCar;
+EXPLAIN ANALYZE
+WITH sales_2023 AS (
+    SELECT region, SUM(value) AS total_sales_2023
+    FROM iea_ev_dataev_saleshistoricalcars
+    WHERE year = 2023
+      AND parameter = 'EV sales'
+      AND mode = 'Cars'
+      AND unit = 'Vehicles'
+    GROUP BY region
+),
+sales_2022 AS (
+    SELECT region, SUM(value) AS total_sales_2022
+    FROM iea_ev_dataev_saleshistoricalcars
+    WHERE year = 2022
+      AND parameter = 'EV sales'
+      AND mode = 'Cars'
+      AND unit = 'Vehicles'
+    GROUP BY region
+),
+stock_share_2023 AS (
+    SELECT region, SUM(value) AS stock_share_2023
+    FROM iea_ev_dataev_saleshistoricalcars
+    WHERE year = 2023
+      AND parameter = 'EV stock share'
+      AND mode = 'Cars'
+      AND unit = 'percent'
+    GROUP BY region
+)
+SELECT
+    s23.region,
+    s22.total_sales_2022,
+    s23.total_sales_2023,
+    ss23.stock_share_2023
+FROM sales_2023 s23
+JOIN sales_2022 s22 ON s23.region = s22.region
+JOIN stock_share_2023 ss23 ON s23.region = ss23.region
+WHERE s23.total_sales_2023 > s22.total_sales_2022
+  AND ss23.stock_share_2023 > 5
+ORDER BY s23.total_sales_2023 DESC;
+
+Зміни
+
+Замінено підзапити на CTE (sales_2023, sales_2022, stock_share_2023) для кращої читабельності та модульності.
+Логіка обчислень не змінена, лише реструктуризована для використання CTE.
+
+Причини змін
+
+Читабельність: CTE робить код більш структурованим і легким для розуміння, особливо при додаванні складніших обчислень.
+Модульність: Кожен CTE можна окремо оптимізувати або повторно використовувати в інших частинах запиту.
+Виконання: СУБД може оптимізувати CTE так само, як і підзапити, але структура полегшує аналіз розробником.
+
+Вплив на продуктивність
+
+План виконання: Зберігається повне сканування таблиці для кожної CTE, аналогічне оригіналу.
+Ключові операції: 
+Nested Loop Inner Join з вартістю ~15.6..15.8 мс.
+Sort додає ~2.48-2.51 мс.
+Table scan на ~382 рядки з матеріалізацією CTE.
+
+
+Висновок: Легка покращена продуктивність  завдяки кращому плануванню CTE, але основна проблема (відсутність індексів) залишається.
+
+Оптимізація з індексом і CTE
+Код
+USE salesHistoricalCar;
+CREATE INDEX idx_ev_sales_filtered
+ON iea_ev_dataev_saleshistoricalcars (year, parameter, mode, unit, region);
+EXPLAIN ANALYZE
+WITH 
+sales_2022 AS (
+    SELECT region, SUM(value) AS total_sales_2022
+    FROM iea_ev_dataev_saleshistoricalcars USE INDEX (idx_ev_sales_filtered)
+    WHERE year = 2022
+      AND parameter = 'EV sales'
+      AND mode = 'Cars'
+      AND unit = 'Vehicles'
+    GROUP BY region
+),
+sales_2023 AS (
+    SELECT region, SUM(value) AS total_sales_2023
+    FROM iea_ev_dataev_saleshistoricalcars USE INDEX (idx_ev_sales_filtered)
+    WHERE year = 2023
+      AND parameter = 'EV sales'
+      AND mode = 'Cars'
+      AND unit = 'Vehicles'
+    GROUP BY region
+),
+stock_share_2023 AS (
+    SELECT region, SUM(value) AS stock_share_2023
+    FROM iea_ev_dataev_saleshistoricalcars USE INDEX (idx_ev_sales_filtered)
+    WHERE year = 2023
+      AND parameter = 'EV stock share'
+      AND mode = 'Cars'
+      AND unit = 'percent'
+    GROUP BY region
+)
+SELECT
+    s23.region,
+    s22.total_sales_2022,
+    s23.total_sales_2023,
+    ss.stock_share_2023
+FROM sales_2023 s23
+JOIN sales_2022 s22 ON s23.region = s22.region
+JOIN stock_share_2023 ss ON s23.region = ss.region
+WHERE s23.total_sales_2023 > s22.total_sales_2022
+  AND ss.stock_share_2023 > 5
+ORDER BY s23.total_sales_2023 DESC;
+
+Зміни
+
+Додано композитний індекс idx_ev_sales_filtered на (year, parameter, mode, unit, region) для прискорення фільтрації.
+Використано USE INDEX (idx_ev_sales_filtered) у кожній CTE для примусового використання індексу.
+
+Причини змін
+
+Продуктивність: Індекс дозволяє СУБД уникнути повного сканування таблиці, використовуючи Index Lookup для фільтрації за year, parameter, mode, unit.
+Оптимізація JOIN: Індекс на region прискорює об’єднання даних між CTE.
+Масштабованість: Для великих таблиць індекс значно зменшує кількість оброблених рядків.
+
+Вплив на продуктивність
+
+План виконання: Використання Covering Index що зменшує кількість оброблених рядків.
+Ключові операції: 
+Nested Loop Inner Join 6.11..6.81 мс
+Sort додає ~0.055 мс.
+Covering Index Lookup на індексі з вартістю ~49.4.
+
+
+Висновок: Значне покращення продуктивності (~6.8 мс завдяки індексу, який оптимізує фільтрацію та доступ до даних.
+
